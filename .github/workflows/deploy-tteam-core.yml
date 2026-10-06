@@ -9,7 +9,7 @@
 # Редовете с "# само deploy repo" setup-github.sh маха във втория режим.
 #
 # САМО РЪЧНО: Actions -> Deploy ... -> Run workflow -> среда + branch/таг/commit
-# на кода. Push НЕ деплойва. В prod — само main.
+# на кода. Push НЕ деплойва. В prod — само master.
 #
 # Поток: build -> push в общия ACR -> migrate job (спира при провал) -> нова
 # ревизия -> трафикът към нея -> health.
@@ -30,10 +30,10 @@ on:
         options:
           - prod
       ref:
-        description: "Кодът: branch, таг или commit (в prod — само main)"
+        description: "Кодът: branch, таг или commit (в prod — само master)"
         required: true
         type: string
-        default: main
+        default: master
 
 permissions:
   id-token: write # Azure OIDC login, без дългоживущи secrets
@@ -55,10 +55,10 @@ jobs:
       RUN_MIGRATIONS: "true"
       HEALTH_PATH: "/api/health"
     steps:
-      - name: Only main goes to prod
-        if: inputs.environment == 'prod' && inputs.ref != 'main'
+      - name: Only master goes to prod
+        if: inputs.environment == 'prod' && inputs.ref != 'master'
         run: |
-          echo "::error::В prod се деплойва само main, а е избрано '${{ inputs.ref }}'. Избери main или среда staging."
+          echo "::error::В prod се деплойва само master, а е избрано '${{ inputs.ref }}'. Избери master или среда staging."
           exit 1
 
       - name: Checkout
