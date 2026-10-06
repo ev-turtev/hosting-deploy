@@ -1,0 +1,158 @@
+# deploy.yml — деплой на приложение в Azure (ТЕМПЛЕЙТ)
+#
+# Попълва го scripts/setup-github.sh (стойностите __...__) в един от двата режима:
+#   - НАШЕТО deploy repo (DEPLOY_REPO в config/platform.env): файлът е
+#     deploy-<клиент>-<приложение>.yml там и тегли кода от repo-то на клиента
+#     с read-only token (secret SOURCE_REPO_TOKEN). Клиентското repo не се пипа.
+#   - repo-то НА КЛИЕНТА (DEPLOY_REPO празно): файлът е .github/workflows/deploy.yml
+#     там и тегли собствения си код.
+# Редовете с "# само deploy repo" setup-github.sh маха във втория режим.
+#
+# САМО РЪЧНО: Actions -> Deploy ... -> Run workflow -> среда + branch/таг/commit
+# на кода. Push НЕ деплойва. В prod — само main.
+#
+# Поток: build -> push в общия ACR -> migrate job (спира при провал) -> нова
+# ревизия -> трафикът към нея -> health.
+#
+# Стойностите за Azure са variables на GitHub environment-а (tteam-core-prod /
+# tteam-core-staging): AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID,
+# PLATFORM_SUBSCRIPTION_ID, ACR_LOGIN_SERVER — setup-github.sh ги задава.
+
+name: Deploy tteam/core to Azure
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Среда"
+        required: true
+        type: choice
+        options:
+          - prod
+      ref:
+        description: "Кодът: branch, таг или commit (в prod — само main)"
+        required: true
+        type: string
+        default: main
+
+permissions:
+  id-token: write # Azure OIDC login, без дългоживущи secrets
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: tteam-core-${{ inputs.environment }}
+    concurrency:
+      # един деплой per (приложение, среда) наведнъж
+      group: deploy-tteam-core-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      CLIENT: tteam
+      APP: core
+      ENV_NAME: ${{ inputs.environment }}
+      DOCKERFILE: deploy/Dockerfile
+      RUN_MIGRATIONS: "true"
+      HEALTH_PATH: "/api/health"
+    steps:
+      - name: Only main goes to prod
+        if: inputs.environment == 'prod' && inputs.ref != 'main'
+        run: |
+          echo "::error::В prod се деплойва само main, а е избрано '${{ inputs.ref }}'. Избери main или среда staging."
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: vladimir488/tteam-core # само deploy repo
+          token: ${{ secrets.SOURCE_REPO_TOKEN }} # само deploy repo
+          ref: ${{ inputs.ref }}
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Names
+        run: |
+          COMMIT=$(git rev-parse HEAD)
+          echo "COMMIT=$COMMIT" >> "$GITHUB_ENV"
+          echo "RG=${CLIENT}-${ENV_NAME}" >> "$GITHUB_ENV"
+          echo "JOB=${APP}-migrate" >> "$GITHUB_ENV"
+          echo "IMAGE=${{ vars.ACR_LOGIN_SERVER }}/${CLIENT}-${APP}:${ENV_NAME}-${COMMIT:0:8}" >> "$GITHUB_ENV"
+
+      - name: ACR login (ACR-ът е в platform-shared subscription-а)
+        run: |
+          az acr login --name "$(echo "${{ vars.ACR_LOGIN_SERVER }}" | cut -d. -f1)" \
+            --subscription "${{ vars.PLATFORM_SUBSCRIPTION_ID }}"
+
+      - name: Build and push
+        run: |
+          docker build -f "$DOCKERFILE" -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Database migrations
+        if: env.RUN_MIGRATIONS == 'true'
+        run: |
+          az containerapp job update --name "$JOB" --resource-group "$RG" --image "$IMAGE" --output none
+          EXECUTION=$(az containerapp job start --name "$JOB" --resource-group "$RG" --query name -o tsv)
+          echo "migrate: $EXECUTION"
+          # Миграциите излизат с non-zero при провал -> статус Failed.
+          for i in $(seq 1 90); do
+            STATUS=$(az containerapp job execution show --name "$JOB" --resource-group "$RG" \
+              --job-execution-name "$EXECUTION" --query properties.status -o tsv 2>/dev/null || echo "Unknown")
+            echo "  status: $STATUS"
+            case "$STATUS" in
+              Succeeded)
+                echo "Миграциите минаха."
+                exit 0
+                ;;
+              Failed|Stopped|Degraded)
+                echo "::error::Миграцията се провали ($STATUS) - деплоят спира, текущата версия остава. Логове: Log Analytics pshared-log, ContainerAppConsoleLogs_CL, ContainerGroupName_s startswith '$EXECUTION'"
+                exit 1
+                ;;
+            esac
+            sleep 10
+          done
+          echo "::error::Миграцията не завърши за 15 минути - деплоят спира."
+          exit 1
+
+      - name: New revision
+        run: |
+          az containerapp update --name "$APP" --resource-group "$RG" --image "$IMAGE" --output none
+
+      - name: Traffic to the latest revision
+        # След rollback трафикът е закован на конкретна ревизия; без тази стъпка
+        # новите деплои не биха получили трафик.
+        run: |
+          az containerapp ingress traffic set --name "$APP" --resource-group "$RG" \
+            --revision-weight latest=100 --output none
+
+      - name: Health check
+        run: |
+          FQDN=$(az containerapp show --name "$APP" --resource-group "$RG" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          URL="https://${FQDN}${HEALTH_PATH}"
+          echo "$URL"
+          # scale to zero: първата заявка събужда приложението (до ~30 s)
+          for i in $(seq 1 24); do
+            if curl -sf --max-time 20 "$URL" > /dev/null; then
+              echo "Здраво."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::$URL не отговори за 4 минути след деплоя."
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy: ${CLIENT}/${APP}/${ENV_NAME}"
+            echo "- Код: \`${{ inputs.ref }}\` @ \`${COMMIT:-?}\`"
+            echo "- Образ: \`${IMAGE:-}\`"
+            echo "- Резултат: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
