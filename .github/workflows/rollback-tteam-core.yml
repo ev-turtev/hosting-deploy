@@ -1,0 +1,92 @@
+# rollback.yml — rollback на приложение в Azure (ТЕМПЛЕЙТ)
+#
+# Попълва го scripts/setup-github.sh — в нашето deploy repo като
+# rollback-<клиент>-<приложение>.yml или в repo-то на клиента като
+# .github/workflows/rollback.yml (двата режима — виж deploy.yml).
+#
+# Ръчно: Actions -> Rollback ... -> Run workflow. Без build — само трафикът се
+# пренасочва към предишна ревизия, за секунди. Миграциите НЕ се връщат
+# (приложена миграция не се редактира, корекцията е нова миграция).
+# Следващият нормален деплой връща трафика към новата ревизия.
+
+name: Rollback tteam/core
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Среда"
+        required: true
+        type: choice
+        options:
+          - prod
+      revision_name:
+        description: "Конкретна ревизия (празно = тази преди текущата)"
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: tteam-core-${{ inputs.environment }}
+    env:
+      RG: tteam-${{ inputs.environment }}
+      APP: core
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Revisions
+        run: |
+          az containerapp revision list --name "$APP" --resource-group "$RG" --all \
+            --query "sort_by([], &properties.createdTime)[-8:].{name:name, active:properties.active, traffic:properties.trafficWeight, created:properties.createdTime}" \
+            -o table
+
+      - name: Target revision
+        id: target
+        env:
+          REVISION: ${{ inputs.revision_name }}
+        run: |
+          if [ -n "$REVISION" ]; then
+            TARGET="$REVISION"
+          else
+            # Текущата = с най-голям трафик; целта = създадената непосредствено преди нея.
+            TARGET=$(az containerapp revision list --name "$APP" --resource-group "$RG" --all -o json | jq -r '
+              sort_by(.properties.createdTime) as $revs
+              | ($revs | map(.properties.trafficWeight // 0) | max) as $top
+              | ($revs | map(.properties.trafficWeight // 0) | index($top)) as $current
+              | if $current > 0 then $revs[$current - 1].name else "" end')
+          fi
+          if [ -z "$TARGET" ]; then
+            echo "::error::Няма предишна ревизия за rollback."
+            exit 1
+          fi
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "Rollback към: $TARGET"
+
+      - name: Activate and shift traffic
+        env:
+          TARGET: ${{ steps.target.outputs.target }}
+        run: |
+          az containerapp revision activate --name "$APP" --resource-group "$RG" --revision "$TARGET" --output none
+          az containerapp ingress traffic set --name "$APP" --resource-group "$RG" \
+            --revision-weight "$TARGET=100" --output none
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Rollback: ${APP} в ${RG}"
+            echo "- Активна ревизия: \`${{ steps.target.outputs.target }}\`"
+            echo "- Result: ${{ job.status }}"
+            echo ""
+            echo "Миграциите НЕ са върнати."
+          } >> "$GITHUB_STEP_SUMMARY"
