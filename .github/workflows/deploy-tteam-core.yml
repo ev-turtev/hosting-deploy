@@ -9,7 +9,7 @@
 # Редовете с "# само deploy repo" setup-github.sh маха във втория режим.
 #
 # САМО РЪЧНО: Actions -> Deploy ... -> Run workflow -> среда + branch/таг/commit
-# на кода. Push НЕ деплойва. В prod — само master.
+# на кода. Push НЕ деплойва. В prod — само основният branch (master).
 #
 # Поток: build -> push в общия ACR -> migrate job (спира при провал) -> нова
 # ревизия -> трафикът към нея -> health.
@@ -41,7 +41,7 @@ permissions:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # заковано: ubuntu-latest сменя версията сам
     environment: tteam-core-${{ inputs.environment }}
     concurrency:
       # един деплой per (приложение, среда) наведнъж
@@ -61,8 +61,12 @@ jobs:
           echo "::error::В prod се деплойва само master, а е избрано '${{ inputs.ref }}'. Избери master или среда staging."
           exit 1
 
+      - name: Read token for the code repo # само deploy repo
+        env: { TOKEN: "${{ secrets.SOURCE_REPO_TOKEN }}" } # само deploy repo
+        run: '[ -n "$TOKEN" ] || { echo "::error::Няма secret SOURCE_REPO_TOKEN в environment tteam-core-${{ inputs.environment }} (token за четене на vladimir488/tteam-core) - ./scripts/setup-github.sh tteam core"; exit 1; }' # само deploy repo
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: vladimir488/tteam-core # само deploy repo
           token: ${{ secrets.SOURCE_REPO_TOKEN }} # само deploy repo

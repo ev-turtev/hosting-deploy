@@ -31,7 +31,7 @@ permissions:
 
 jobs:
   rollback:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # заковано: ubuntu-latest сменя версията сам
     environment: tteam-core-${{ inputs.environment }}
     env:
       RG: tteam-${{ inputs.environment }}
