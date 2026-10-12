@@ -1,0 +1,94 @@
+# backup.yml — бекъп на базата на приложение (ТЕМПЛЕЙТ; попълва го setup-github.sh)
+#
+# pg_dump (вътре в мрежата на Azure, в dbinit job-а) -> временно в Storage на
+# средата -> тук -> ARTIFACT на пускането (сваля се от страницата му, пази се
+# 90 дни) -> копието в Storage се трие веднага. Друго съхранение няма.
+#
+# Ръчно: Actions -> Backup ... -> Run workflow -> среда.
+# Само ръчно. Нощните бекъпи са отделни — наши, в Azure (scheduled job на
+# приложението, Storage в platform-shared), не в GitHub.
+#
+# Restore: Actions -> Restore ... -> източник run:<номера на това пускане> или latest.
+
+name: Backup tteam/core
+run-name: Backup tteam/core ${{ inputs.environment }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Среда"
+        required: true
+        type: choice
+        options:
+          - prod
+
+permissions:
+  id-token: write # Azure OIDC login
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-24.04 # заковано: ubuntu-latest сменя версията сам
+    environment: tteam-core-${{ inputs.environment }}
+    concurrency:
+      # не едновременно с деплой / restore на същата среда
+      group: deploy-tteam-core-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      CLIENT: tteam
+      APP: core
+      ENV_NAME: ${{ inputs.environment }}
+      RETENTION_DAYS: "90"
+    steps:
+      - name: Checkout (само помощните скриптове)
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/hosting
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Backup (pg_dump в Azure)
+        run: |
+          set -euo pipefail
+          source .github/hosting/job.sh
+          RG="${CLIENT}-${ENV_NAME}"
+          STAMP=$(date -u +%Y%m%d-%H%M)
+          FILE="${CLIENT}-${APP}-${ENV_NAME}-${STAMP}.dump"
+          BLOB="transfer/${GITHUB_RUN_ID}-backup.dump"
+          storage_init
+          trap 'storage_delete "$BLOB"; echo "копието в Storage е изтрито"' EXIT
+          storage_sas_url "$BLOB" cw
+          EXTRA=$(jq -n --arg u "$SAS_URL" '[{name: "UPLOAD_URL", value: $u}]')
+          job_run_script "${APP}-dbinit" "${{ vars.ACR_LOGIN_SERVER }}/tools/pgtools:16" .github/hosting/dbdump.sh "$EXTRA"
+          mkdir -p backup
+          az storage blob download --account-name "$STORAGE" --account-key "$STORAGE_KEY" --container-name "$APP" \
+            --name "$BLOB" --file "backup/$FILE" --only-show-errors --output none
+          [ "$(head -c 5 "backup/$FILE")" = "PGDMP" ] || { echo "::error::файлът не е pg_dump"; exit 1; }
+          echo "FILE=$FILE" >> "$GITHUB_ENV"
+          echo "SIZE=$(du -h "backup/$FILE" | cut -f1)" >> "$GITHUB_ENV"
+
+      - name: Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: backup-${{ env.CLIENT }}-${{ env.APP }}-${{ env.ENV_NAME }}
+          path: backup/${{ env.FILE }}
+          retention-days: ${{ env.RETENTION_DAYS }}
+          compression-level: 0 # дъмпът (-Fc) вече е компресиран
+          if-no-files-found: error
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Backup: ${CLIENT}/${APP}/${ENV_NAME}"
+            echo "- Резултат: ${{ job.status }}"
+            echo "- Файл: \`${FILE:-—}\` (${SIZE:-—})"
+            echo "- Сваляне: тази страница -> **Artifacts** (долу) -> backup-${CLIENT}-${APP}-${ENV_NAME}. Пази се ${RETENTION_DAYS} дни."
+            echo "- Restore: Actions -> Restore ${CLIENT}/${APP} -> източник \`run:${GITHUB_RUN_ID}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
