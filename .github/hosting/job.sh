@@ -36,10 +36,10 @@ job_run() {
   job_wait "$job" "$JOB_EXECUTION"
 }
 
-# Чака изпълнението (до 15 минути). 0 = Succeeded.
+# Чака изпълнението (до 60 минути). 0 = Succeeded.
 job_wait() {
   local job="$1" execution="$2" status="Unknown" i
-  for i in $(seq 1 90); do
+  for i in $(seq 1 360); do # до 60 минути (= replicaTimeout на job-овете)
     status=$(az containerapp job execution show --name "$job" --resource-group "$RG" \
       --job-execution-name "$execution" --query properties.status -o tsv 2>/dev/null || echo "Unknown")
     case "$status" in

@@ -11,7 +11,9 @@ set -eu
 #   - разширенията са създадени от dbinit (администратора) — техните редове
 #     (EXTENSION, COMMENT - EXTENSION) се пропускат: собственикът на базата
 #     няма право върху тях;
-#   - в ЕДНА транзакция: при грешка базата остава празна, не наполовина.
+#   - обект по обект, в 2 паралелни потока (--jobs): големи бази (хиляди таблици)
+#     не се събират в една транзакция (заключванията). При грешка базата остава
+#     ЧАСТИЧНО заредена — Restore се пуска пак (започва с изтриване).
 #
 # Без двоен долар и без "долар + скоба" (Kubernetes ги преобразува).
 
@@ -28,7 +30,7 @@ grep -E ' (EXTENSION - |COMMENT - EXTENSION )' /tmp/restore.all | sed 's/^/dbres
 
 PGUSER="$MIGRATOR_ROLE" PGPASSWORD="$MIGRATOR_PASSWORD" pg_restore \
   --dbname="$TARGET_DB" --use-list=/tmp/restore.list \
-  --no-owner --single-transaction --exit-on-error /tmp/restore.dump
+  --no-owner --exit-on-error --jobs=2 /tmp/restore.dump
 
 rm -f /tmp/restore.dump /tmp/restore.all /tmp/restore.list
 
