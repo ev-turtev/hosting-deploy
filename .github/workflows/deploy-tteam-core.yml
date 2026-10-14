@@ -107,7 +107,7 @@ jobs:
           EXECUTION=$(az containerapp job start --name "$JOB" --resource-group "$RG" --query name -o tsv)
           echo "migrate: $EXECUTION"
           # Миграциите излизат с non-zero при провал -> статус Failed.
-          for i in $(seq 1 90); do
+          for i in $(seq 1 360); do # до 60 минути (= replicaTimeout на migrate job-а)
             STATUS=$(az containerapp job execution show --name "$JOB" --resource-group "$RG" \
               --job-execution-name "$EXECUTION" --query properties.status -o tsv 2>/dev/null || echo "Unknown")
             echo "  status: $STATUS"
@@ -123,7 +123,7 @@ jobs:
             esac
             sleep 10
           done
-          echo "::error::Миграцията не завърши за 15 минути - деплоят спира."
+          echo "::error::Миграцията не завърши за 60 минути - деплоят спира."
           exit 1
 
       - name: New revision
