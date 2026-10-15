@@ -28,6 +28,35 @@ pg_restore -l /tmp/restore.dump > /tmp/restore.all
 grep -v -E ' (EXTENSION - |COMMENT - EXTENSION )' /tmp/restore.all > /tmp/restore.list || true
 grep -E ' (EXTENSION - |COMMENT - EXTENSION )' /tmp/restore.all | sed 's/^/dbrestore: пропуснато (създадено от dbinit): /' || true
 
+# Ролите НЕ са в pg_dump (общи са за сървъра). Дъмпът обаче ги споменава —
+# в правата (GRANT ... TO), правилата за сигурност (CREATE POLICY ... TO) и
+# default privileges. Липсващите се създават преди зареждането като роли БЕЗ
+# вход (NOLOGIN), от ролята-собственик — иначе pg_restore пада с "role ... does
+# not exist". Нужна ли е на някоя вход с парола — това е работа на миграциите
+# на приложението; тук само се изписва.
+pg_restore --schema-only --use-list=/tmp/restore.list -f /tmp/restore.schema.sql /tmp/restore.dump
+{
+  grep -E '^(CREATE POLICY |GRANT |ALTER DEFAULT PRIVILEGES )' /tmp/restore.schema.sql | sed -n 's/.* TO \(.*\)$/\1/p'
+  grep -E '^(REVOKE |ALTER DEFAULT PRIVILEGES .* REVOKE )' /tmp/restore.schema.sql | sed -n 's/.* FROM \(.*\)$/\1/p'
+  grep -E '^ALTER DEFAULT PRIVILEGES FOR ROLE ' /tmp/restore.schema.sql | sed -n 's/^ALTER DEFAULT PRIVILEGES FOR ROLE \([^ ]*\) .*/\1/p'
+} | sed -e 's/ USING .*//' -e 's/ WITH CHECK .*//' -e 's/ WITH GRANT OPTION.*//' -e 's/ GRANTED BY .*//' -e 's/;.*//' \
+  | tr ',' '\n' | sed -e 's/^ *//' -e 's/ *$//' -e 's/"//g' \
+  | grep -E '^[^[:space:]]+$' | grep -viE '^(public|current_user|session_user|current_role)$' \
+  | sort -u > /tmp/restore.roles || true
+rm -f /tmp/restore.schema.sql
+echo "dbrestore: роли, споменати в дъмпа: `tr '\n' ' ' < /tmp/restore.roles`"
+while read -r r; do
+  [ -n "$r" ] || continue
+  printf '%s\n' \
+    "SELECT NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'r') AS missing \\gset" \
+    '\if :missing' \
+    '  CREATE ROLE :"r" NOLOGIN;' \
+    '  \echo dbrestore: СЪЗДАДЕНА липсваща роля (NOLOGIN) :r' \
+    '\endif' \
+    | PGUSER="$MIGRATOR_ROLE" PGPASSWORD="$MIGRATOR_PASSWORD" psql -q -v ON_ERROR_STOP=1 -v r="$r" -d "$TARGET_DB"
+done < /tmp/restore.roles
+rm -f /tmp/restore.roles
+
 PGUSER="$MIGRATOR_ROLE" PGPASSWORD="$MIGRATOR_PASSWORD" pg_restore \
   --dbname="$TARGET_DB" --use-list=/tmp/restore.list \
   --no-owner --exit-on-error --jobs=2 /tmp/restore.dump
