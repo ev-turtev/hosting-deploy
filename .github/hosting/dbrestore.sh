@@ -43,6 +43,11 @@ pg_restore --schema-only --use-list=/tmp/restore.list -f /tmp/restore.schema.sql
   | tr ',' '\n' | sed -e 's/^ *//' -e 's/ *$//' -e 's/"//g' \
   | grep -E '^[^[:space:]]+$' | grep -viE '^(public|current_user|session_user|current_role)$' \
   | sort -u > /tmp/restore.roles || true
+# "ALTER DEFAULT PRIVILEGES FOR ROLE X" изисква ролята-собственик да е ЧЛЕН на X
+# (в PostgreSQL 16 създателят на роля не е член с права по подразбиране).
+grep -E '^ALTER DEFAULT PRIVILEGES FOR ROLE ' /tmp/restore.schema.sql \
+  | sed -n 's/^ALTER DEFAULT PRIVILEGES FOR ROLE \([^ ]*\) .*/\1/p' | sed -e 's/"//g' \
+  | grep -vx "$MIGRATOR_ROLE" | sort -u > /tmp/restore.forroles || true
 rm -f /tmp/restore.schema.sql
 echo "dbrestore: роли, споменати в дъмпа: `tr '\n' ' ' < /tmp/restore.roles`"
 while read -r r; do
@@ -55,11 +60,37 @@ while read -r r; do
     '\endif' \
     | PGUSER="$MIGRATOR_ROLE" PGPASSWORD="$MIGRATOR_PASSWORD" psql -q -v ON_ERROR_STOP=1 -v r="$r" -d "$TARGET_DB"
 done < /tmp/restore.roles
-rm -f /tmp/restore.roles
+while read -r r; do
+  [ -n "$r" ] || continue
+  printf '%s\n' \
+    "SELECT NOT pg_has_role(current_user, :'r', 'USAGE') AS need \\gset" \
+    '\if :need' \
+    '  GRANT :"r" TO CURRENT_USER WITH INHERIT TRUE, SET TRUE;' \
+    '  \echo dbrestore: собственикът стана член на :r (заради default privileges)' \
+    '\endif' \
+    | PGUSER="$MIGRATOR_ROLE" PGPASSWORD="$MIGRATOR_PASSWORD" psql -q -v ON_ERROR_STOP=1 -v r="$r" -d "$TARGET_DB"
+done < /tmp/restore.forroles
+rm -f /tmp/restore.roles /tmp/restore.forroles
 
+# Без --exit-on-error: зарежда докрай и СЪБИРА всички грешки — едно пускане
+# показва всичко (иначе спира на първата, често след десетки минути данни).
+# Грешка има ли — изписват се групирани и job-ът завършва с грешка.
 PGUSER="$MIGRATOR_ROLE" PGPASSWORD="$MIGRATOR_PASSWORD" pg_restore \
   --dbname="$TARGET_DB" --use-list=/tmp/restore.list \
-  --no-owner --exit-on-error --jobs=2 /tmp/restore.dump
+  --no-owner --jobs=2 /tmp/restore.dump 2> /tmp/restore.err || true
+# При --jobs двата потока пишат грешките преплетени ("pg_restore:pg_restore:
+# error: error: ...") — затова ERROR: се търси навсякъде в реда, а броят е от
+# последния ред "errors ignored on restore: N".
+if grep -q 'ERROR:\|errors ignored on restore\|pg_restore: error' /tmp/restore.err; then
+  echo "dbrestore: ГРЕШКИ при зареждането — `grep -o 'errors ignored on restore: [0-9]*' /tmp/restore.err | tail -1`. По вид:" >&2
+  grep -o 'ERROR:  .*' /tmp/restore.err | sed -e 's/"[^"]*"/"…"/g' | sort | uniq -c | sort -rn | head -30 >&2
+  echo "dbrestore: първите заявки с грешка:" >&2
+  grep '^Command was' /tmp/restore.err | head -10 >&2
+  grep -v 'ERROR:\|^Command was\|^HINT\|^DETAIL\|^ \|^$\|errors ignored' /tmp/restore.err | head -10 >&2
+  rm -f /tmp/restore.err
+  exit 1
+fi
+rm -f /tmp/restore.err
 
 rm -f /tmp/restore.dump /tmp/restore.all /tmp/restore.list
 
